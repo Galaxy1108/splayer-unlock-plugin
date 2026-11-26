@@ -86,7 +86,7 @@ Network proxy (梯子/VPN) for accessing blocked resources during development. `
  * @id          music-unlock.splayer
  * @version     1.0.0
  * @description 通过多个解锁服务获取歌曲播放地址
- * @author      splayer
+ * @author      galaxy1108
  * @type        source
  * @apiLevel    1
  */
@@ -125,11 +125,29 @@ Write the plugin to replicate Splayer's unlock flow:
 ## Plugin behavior
 
 - Unlock order: **netease (GD音乐台, ID直查)** → **bodian (Kuwo Bodian, 关键词搜索)** → **kuwo (Kwok DES, 关键词搜索)**
+- Kuwo attempt order: `antiserver.kuwo.cn/anti.s` → `mobi.kuwo.cn/mobi.s` (kwDES). `www.kuwo.cn/url` is dead (returns the SPA HTML) and must not be used.
 - First successful result wins; all three fail → throws → player tries next candidate plugin
 - Returns `{ url, quality: "hq"|"lossless" }`; quality inferred from file extension
 - `wy` source gets all three tries; `tx`/`kg` skip netease unlock (ID-based, only works for netease IDs)
 - kwDES is inlined pure-JS DES implementation (no Node deps needed)
 - `splayer.utils.crypto.md5` replaces Node's `crypto.createHash` for Bodian signature
+
+### Never send forbidden request headers
+
+`host`, `origin`, `referer`-style forbidden headers are rejected by Electron's `net.fetch` with
+`net::ERR_INVALID_ARGUMENT` (the plugin only sees a generic network error). Setting `host:
+"bd-api.kuwo.cn"` silently broke **every** bodian request in the app, so playback always fell
+through to the broken Kuwo path. Do not re-add it.
+
+### Kuwo returns prompt tones, not errors
+
+For tracks that are not streamable (e.g. “仅手机端可播放”), Kuwo replies HTTP 200 with a short
+spoken notice instead of failing. Verified placeholders:
+`/resource/n1/69/32/588957081.mp3` (antiserver, ~11.3s, 181521 bytes) and
+`/trackmedia/M5000004Gmy54cGDqK.mp3` (mobi fallback, ~11.5s).
+The mobi response also echoes `rid=<id>` — a mismatch means it served the fallback, not the song.
+`looksLikeRealTrack()` in the plugin additionally HEADs the URL and rejects files smaller than
+0.2× the 128kbps size implied by the search-reported duration.
 
 ## Important constraints
 

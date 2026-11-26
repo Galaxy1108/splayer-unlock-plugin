@@ -1,9 +1,9 @@
 /**
  * @name        Music Unlock
  * @id          music-unlock.splayer
- * @version     1.1.0
+ * @version     1.2.0
  * @description 通过多个解锁服务获取歌曲播放地址
- * @author      splayer
+ * @author      galaxy1108
  * @type        source
  * @apiLevel    1
  */
@@ -236,6 +236,46 @@ const isSongMatch = (resultName, resultArtist, match) => {
   return true;
 };
 
+/* ====== Placeholder (prompt tone) detection ====== */
+
+// Kuwo answers "unavailable" requests with a short spoken notice instead of an
+// error, e.g. “当前歌曲仅在酷我音乐手机端最新版可播放”. These files are real
+// HTTP 200 audio, so a naive `startsWith("http")` check would happily report
+// them as a successful unlock. Known placeholders:
+//   - antiserver.kuwo.cn  → ~11.3s notice, 181521 bytes
+//   - mobi convert_url2   → ~11.5s fallback, echoed rid != requested rid
+const KW_PLACEHOLDER_MARKERS = [
+  "/resource/n1/69/32/588957081.mp3",
+  "/trackmedia/M5000004Gmy54cGDqK.mp3",
+];
+
+const isKwPlaceholder = (url) => KW_PLACEHOLDER_MARKERS.some((marker) => url.includes(marker));
+
+const headerValue = (headers, name) => {
+  if (!headers) return undefined;
+  if (typeof headers.get === "function") return headers.get(name) || undefined;
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
+  return key ? headers[key] : undefined;
+};
+
+// Last line of defence: compare the remote file size with the duration reported
+// by Kuwo search. Even a 48kbps encode is ~0.38x of the 128kbps estimate used
+// here, so anything below 0.2x is a notice/preview, not the requested track.
+const looksLikeRealTrack = async (url, durationSec) => {
+  if (!url || !/^https?:\/\//i.test(url)) return false;
+  if (isKwPlaceholder(url)) return false;
+  let size = 0;
+  try {
+    const resp = await splayer.request(url, { method: "HEAD", responseType: "text" });
+    size = Number(headerValue(resp.headers, "content-length")) || 0;
+  } catch {
+    return true; // can't verify (HEAD blocked) — keep the URL instead of failing
+  }
+  if (!size) return true;
+  if (durationSec > 0 && size < durationSec * 16000 * 0.2) return false;
+  return true;
+};
+
 /* ====== Unlock services ====== */
 
 const generateDeviceId = () => {
@@ -276,7 +316,8 @@ const searchKuwo = async (match) => {
     if (!item.id) continue;
     const artistStr = item.artists.map((a) => a.name).join("&") || "";
     if (isSongMatch(item.name || "", artistStr, match)) {
-      return item.id;
+      const durationMs = Number(item.duration);
+      return { id: item.id, durationSec: Number.isFinite(durationMs) ? durationMs / 1000 : 0 };
     }
   }
   return null;
@@ -285,13 +326,15 @@ const searchKuwo = async (match) => {
 const sendAdFreeRequest = () => {
   const adurl =
     "http://bd-api.kuwo.cn/api/service/advert/watch?uid=-1&token=&timestamp=1724306124436&sign=15a676d66285117ad714e8c8371691da";
+  // NB: never set a `host` header here. Electron's net.fetch (Chromium) rejects
+  // forbidden headers with net::ERR_INVALID_ARGUMENT, which silently broke every
+  // bodian request in the app.
   const headers = {
     "user-agent": "Dart/2.19 (dart:io)",
     plat: "ar",
     channel: "aliopen",
     devid: _deviceId,
     ver: "3.9.0",
-    host: "bd-api.kuwo.cn",
     qimei36: "1e9970cbcdc20a031dee9f37100017e1840e",
     "content-type": "application/json; charset=utf-8",
   };
@@ -337,15 +380,15 @@ const unlockByNetease = async (id) => {
 const unlockByBodian = async (match) => {
   try {
     if (!match.keyword) return null;
-    const songId = await searchKuwo(match);
-    if (!songId) return null;
+    const hit = await searchKuwo(match);
+    if (!hit) return null;
+    const songId = hit.id;
     const headers = {
       "user-agent": "Dart/2.19 (dart:io)",
       plat: "ar",
       channel: "aliopen",
       devid: _deviceId,
       ver: "3.9.0",
-      host: "bd-api.kuwo.cn",
       "X-Forwarded-For": "1.0.1.114",
     };
     try { await sendAdFreeRequest(); } catch {}
@@ -357,6 +400,7 @@ const unlockByBodian = async (match) => {
       const result = await splayer.request(audioUrl, { headers, responseType: "json" });
       if (result.body && result.body.data && result.body.data.audioUrl) {
         const url = result.body.data.audioUrl;
+        if (isKwPlaceholder(url)) continue;
         const quality = url.includes(".flac") || url.includes(".wav") ? "lossless" : "hq";
         return { url, quality };
       }
@@ -370,38 +414,28 @@ const unlockByBodian = async (match) => {
 const unlockByKuwo = async (match) => {
   try {
     if (!match.keyword) return null;
-    const songId = await searchKuwo(match);
-    if (!songId) return null;
+    const hit = await searchKuwo(match);
+    if (!hit) return null;
+    const songId = hit.id;
 
-    // Try 1: antiserver.kuwo.cn (no encryption, reliable for full song MP3)
+    // Try 1: antiserver.kuwo.cn (no encryption, plain text URL).
+    // For mobile-only / restricted tracks Kuwo answers with a spoken notice
+    // (“当前歌曲仅在酷我音乐手机端最新版可播放”) instead of an error, so the URL
+    // must be verified before it is reported as a successful unlock.
     {
       const antiUrl = `http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_${songId}`;
       const result = await splayer.request(antiUrl, { responseType: "text" });
       if (result.body) {
         const body = String(result.body).trim();
-        if (body && body.startsWith("http")) {
+        if (/^https?:\/\//i.test(body) && (await looksLikeRealTrack(body, hit.durationSec))) {
           return { url: body, quality: "hq" };
         }
       }
     }
 
-    // Try 2: www.kuwo.cn/url (web API, supports bitrate)
-    {
-      const kwUrl = `http://www.kuwo.cn/url?format=mp3&response=url&type=convert_url3&br=320kmp3&rid=${songId}`;
-      const result = await splayer.request(kwUrl, {
-        headers: { Referer: "http://www.kuwo.cn/" },
-        responseType: "text",
-      });
-      if (result.body) {
-        const body = String(result.body).trim();
-        if (body && body.startsWith("http")) {
-          const quality = body.includes(".flac") || body.includes(".wav") ? "lossless" : "hq";
-          return { url: body, quality };
-        }
-      }
-    }
-
-    // Try 3: mobi.s with kwDES (last resort, may return trial preview)
+    // Try 2: mobi.s with kwDES (last resort, may return a placeholder).
+    // The response echoes the requested `rid`; a different one means Kuwo
+    // served a fallback notice rather than the song.
     {
       const PackageName = "kwplayer_ar_5.1.0.0_B_jiakong_vh.apk";
       const url =
@@ -414,12 +448,17 @@ const unlockByKuwo = async (match) => {
         headers: { "User-Agent": "okhttp/3.10.0" },
         responseType: "text",
       });
-      if (result.body) {
-        const urlMatch = String(result.body).match(/http[^\s$"]+/);
-        if (urlMatch) {
-          const quality = urlMatch[0].includes(".flac") || urlMatch[0].includes(".wav") ? "lossless" : "hq";
-          return { url: urlMatch[0], quality };
-        }
+      const text = String(result.body || "");
+      const echoedRid = (text.match(/(?:^|\n)rid=(\d+)/) || [])[1];
+      const urlMatch = text.match(/(?:^|\n)url=(https?:\/\/\S+)/);
+      if (
+        urlMatch &&
+        echoedRid === String(songId) &&
+        (await looksLikeRealTrack(urlMatch[1], hit.durationSec))
+      ) {
+        const quality =
+          urlMatch[1].includes(".flac") || urlMatch[1].includes(".wav") ? "lossless" : "hq";
+        return { url: urlMatch[1], quality };
       }
     }
 
